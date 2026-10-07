@@ -1,0 +1,12 @@
+[package]
+name = "solfege_soundfonteditor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18"
+eframe = "0.36"
+egui = "0.36"
+hound = "3.5.1"
+rfd = "0.17"
