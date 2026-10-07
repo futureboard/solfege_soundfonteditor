@@ -10,6 +10,8 @@ use crate::sf2::{SoundFont, Zone};
 const MAX_VOICES: usize = 96;
 /// Release floor: a voice is finished once its envelope is ~-100 dB.
 const SILENCE: f32 = 1e-5;
+/// Fade time when a voice is cut by another note in its exclusive class (hi-hat choke).
+const CHOKE_SECS: f32 = 0.008;
 
 #[derive(Clone)]
 pub struct VoiceParams {
@@ -106,6 +108,7 @@ struct Voice {
     level: f32,
     decay_mul: f32,
     release_mul: f32,
+    choke_mul: f32,
     released: bool,
     filter: Biquad,
     gain_l: f32,
@@ -129,11 +132,21 @@ impl Voice {
             level: 0.0,
             decay_mul: mul(p.decay),
             release_mul: mul(p.release),
+            choke_mul: mul(CHOKE_SECS),
             released: false,
             filter,
             gain_l: angle.cos() * p.gain,
             gain_r: angle.sin() * p.gain,
             p,
+        }
+    }
+
+    /// Fast fade-out, used when another note of the same exclusive class starts.
+    fn choke(&mut self) {
+        self.released = true;
+        self.release_mul = self.release_mul.min(self.choke_mul);
+        if self.stage != Stage::Done {
+            self.stage = Stage::Release;
         }
     }
 
@@ -239,7 +252,7 @@ impl Mixer {
             if p.exclusive_class != 0 {
                 for v in &mut self.voices {
                     if v.p.exclusive_class == p.exclusive_class {
-                        v.stage = Stage::Done;
+                        v.choke();
                     }
                 }
             }
@@ -528,4 +541,51 @@ fn voice_from_gens(sf: &SoundFont, sample_idx: usize, g: &Gens, key: u8, vel: u8
         filter_q: 10f32.powf(g[sfgen::INITIAL_FILTER_Q as usize].clamp(0, 960) as f32 / 200.0).max(0.707),
         exclusive_class: g[sfgen::EXCLUSIVE_CLASS as usize].clamp(0, 127) as u8,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hat(class: u8) -> VoiceParams {
+        VoiceParams {
+            data: Arc::new(vec![10_000; 48_000]),
+            start: 0,
+            end: 48_000,
+            loop_start: 0,
+            loop_end: 0,
+            mode: 0,
+            sample_rate: 48_000,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            pan: 0.0,
+            delay: 0.0,
+            attack: 0.0,
+            hold: 0.0,
+            decay: 0.0,
+            sustain: 1.0,
+            release: 1.0,
+            filter_fc: f32::MAX,
+            filter_q: 0.707,
+            exclusive_class: class,
+        }
+    }
+
+    #[test]
+    fn exclusive_class_chokes_quickly() {
+        let mut m = Mixer::new(48_000.0);
+        let mut buf = vec![0.0; 2 * 480];
+        m.note_on(46, vec![hat(1)]); // open hat
+        m.render(&mut buf, 2);
+        m.note_on(42, vec![hat(1)]); // closed hat chokes it
+        m.note_on(36, vec![hat(0)]); // kick (no class) is untouched
+        assert_eq!(m.active_voices(), 3);
+        // 20 ms later only the open hat is gone.
+        for _ in 0..2 {
+            m.render(&mut buf, 2);
+        }
+        let mut keys: Vec<u8> = m.voices.iter().map(|v| v.key).collect();
+        keys.sort();
+        assert_eq!(keys, vec![36, 42]);
+    }
 }
