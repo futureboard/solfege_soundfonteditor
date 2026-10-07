@@ -313,47 +313,130 @@ impl Mixer {
     }
 }
 
+/// User-selectable output settings. `None` means "system default".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioConfig {
+    pub device_id: Option<String>,
+    pub buffer_size: Option<u32>,
+}
+
+pub struct OutputDevice {
+    pub id: String,
+    pub name: String,
+}
+
+/// Output devices of the default host. Enumeration can be slow, so call it on demand.
+pub fn output_devices() -> Vec<OutputDevice> {
+    let host = cpal::default_host();
+    let Ok(devices) = host.output_devices() else { return Vec::new() };
+    devices
+        .filter_map(|d| {
+            let id = d.id().ok()?.to_string();
+            let name = d.description().map(|x| x.name().to_string()).unwrap_or_else(|_| id.clone());
+            Some(OutputDevice { id, name })
+        })
+        .collect()
+}
+
 pub struct Audio {
     _stream: Option<cpal::Stream>,
     pub mixer: Arc<Mutex<Mixer>>,
     pub sample_rate: u32,
     pub error: Option<String>,
+    /// Non-fatal note, e.g. the saved device was missing and the default was used.
+    pub warning: Option<String>,
     pub device_name: String,
+    pub config: AudioConfig,
 }
 
 impl Audio {
-    pub fn new() -> Self {
-        match Self::open() {
+    pub fn new(config: &AudioConfig) -> Self {
+        match Self::open(config) {
             Ok(a) => a,
             Err(e) => Self {
                 _stream: None,
                 mixer: Arc::new(Mutex::new(Mixer::new(44100.0))),
                 sample_rate: 44100,
                 error: Some(e.to_string()),
+                warning: None,
                 device_name: "none".into(),
+                config: config.clone(),
             },
         }
     }
 
-    fn open() -> anyhow::Result<Self> {
+    /// Close the current stream and open a new one with `config`, keeping the master volume.
+    pub fn reopen(&mut self, config: &AudioConfig) {
+        let master = self.mixer.lock().map(|m| m.master).unwrap_or(0.8);
+        self._stream = None; // release the device before opening it again
+        *self = Self::new(config);
+        if let Ok(mut m) = self.mixer.lock() {
+            m.master = master;
+        }
+    }
+
+    pub fn status(&self) -> String {
+        match (&self.error, &self.warning) {
+            (Some(e), _) => format!("Audio unavailable: {e}"),
+            (None, Some(w)) => format!("Audio: {} @ {} Hz ({w})", self.device_name, self.sample_rate),
+            (None, None) => format!("Audio: {} @ {} Hz", self.device_name, self.sample_rate),
+        }
+    }
+
+    fn open(cfg: &AudioConfig) -> anyhow::Result<Self> {
         let host = cpal::default_host();
-        let device =
-            host.default_output_device().ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
-        let device_name =
-            device.description().map(|d| d.to_string()).unwrap_or_else(|_| "default".into());
+        let mut warning = None;
+        let chosen = cfg.device_id.as_ref().and_then(|want| {
+            let found = host
+                .output_devices()
+                .ok()?
+                .find(|d| d.id().is_ok_and(|id| id.to_string() == *want));
+            if found.is_none() {
+                warning = Some("selected device not found, using default".to_string());
+            }
+            found
+        });
+        let device = match chosen {
+            Some(d) => d,
+            None => host.default_output_device().ok_or_else(|| anyhow::anyhow!("no audio output device"))?,
+        };
+        let device_name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "default".into());
         let supported = device.default_output_config()?;
-        let config: cpal::StreamConfig = supported.config();
+        let mut config: cpal::StreamConfig = supported.config();
         let sample_rate = config.sample_rate;
         let mixer = Arc::new(Mutex::new(Mixer::new(sample_rate as f32)));
-        let stream = match supported.sample_format() {
-            cpal::SampleFormat::F32 => build::<f32>(&device, config, mixer.clone())?,
-            cpal::SampleFormat::I16 => build::<i16>(&device, config, mixer.clone())?,
-            cpal::SampleFormat::I32 => build::<i32>(&device, config, mixer.clone())?,
-            cpal::SampleFormat::U16 => build::<u16>(&device, config, mixer.clone())?,
+        let make = |config: cpal::StreamConfig| match supported.sample_format() {
+            cpal::SampleFormat::F32 => build::<f32>(&device, config, mixer.clone()),
+            cpal::SampleFormat::I16 => build::<i16>(&device, config, mixer.clone()),
+            cpal::SampleFormat::I32 => build::<i32>(&device, config, mixer.clone()),
+            cpal::SampleFormat::U16 => build::<u16>(&device, config, mixer.clone()),
             other => anyhow::bail!("unsupported sample format {other:?}"),
         };
+        let stream = match cfg.buffer_size {
+            Some(frames) => {
+                config.buffer_size = cpal::BufferSize::Fixed(frames);
+                match make(config) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // The device rejected the size: fall back to its default.
+                        warning = Some(format!("buffer size {frames} not supported, using default"));
+                        config.buffer_size = cpal::BufferSize::Default;
+                        make(config)?
+                    }
+                }
+            }
+            None => make(config)?,
+        };
         stream.play()?;
-        Ok(Self { _stream: Some(stream), mixer, sample_rate, error: None, device_name })
+        Ok(Self {
+            _stream: Some(stream),
+            mixer,
+            sample_rate,
+            error: None,
+            warning,
+            device_name,
+            config: cfg.clone(),
+        })
     }
 
     pub fn note_on(&self, key: u8, params: Vec<VoiceParams>) {

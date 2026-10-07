@@ -29,3 +29,22 @@ impl Edit {
 pub fn is_black_key(key: u8) -> bool {
     matches!(key % 12, 1 | 3 | 6 | 8 | 10)
 }
+
+/// A titled, bordered section used to group related controls.
+pub fn card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let v = ui.visuals();
+    egui::Frame::NONE
+        .fill(v.faint_bg_color)
+        .stroke(v.widgets.noninteractive.bg_stroke)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if !title.is_empty() {
+                ui.label(egui::RichText::new(title).strong());
+                ui.add_space(4.0);
+            }
+            add(ui)
+        })
+        .inner
+}

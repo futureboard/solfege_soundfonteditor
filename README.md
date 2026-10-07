@@ -6,7 +6,7 @@ A SoundFont 2 (`.sf2`) editor written in Rust with **egui** on the **wgpu** rend
 
 - **Open / save SF2**: a self-contained RIFF reader and writer (`src/sf2`). Saves go to a temp file first, so a failed save can't corrupt the original.
 - **Presets / Instruments / Samples** in a filterable list. You can create, duplicate (Ctrl+D) and delete items. Deleting cleans up the references to them.
-- **Zone editor**: pick the instrument/sample, set key and velocity ranges, and see a key-range map. You can add a global zone and sort zones by key.
+- **Zone editor**: pick the instrument/sample and set key and velocity ranges. A horizontal key map sits above a piano strip; zones that don't overlap share a row. You can add a global zone and sort zones by key.
 - **Generator editor**: covers every SF2 generator, with units shown in Hz, dB, ms and note names. Preset-level values are shown as offsets. Values inherited from the global zone are displayed.
 - **Modulator editor**: edits the raw SF2 modulator records.
 - **Sample editor**:
@@ -19,6 +19,7 @@ A SoundFont 2 (`.sf2`) editor written in Rust with **egui** on the **wgpu** rend
 - **Preview synth**:
   - Play with the on-screen piano or the computer keyboard (Z–M / Q–P, ←/→ to change octave, Esc for all notes off).
   - Supports a volume envelope, a low-pass filter, loop modes, exclusive classes and pan.
+- **Audio settings** (View → Audio settings… or the ⚙ button): choose the output device and buffer size. The choice is remembered between runs.
 - **Undo / redo** (Ctrl+Z / Ctrl+Y). Problem checker for duplicate bank/program, empty zones and invalid loops.
 - Drag and drop `.sf2` files to open them, or `.wav` files to import them.
 

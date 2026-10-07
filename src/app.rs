@@ -5,18 +5,21 @@ use egui::{
     Align, Color32, ComboBox, DragValue, Key, KeyboardShortcut, Layout, Modifiers, RichText, ScrollArea, TextEdit, Ui,
 };
 
-use crate::audio::{self, Audio};
+use crate::audio::{self, Audio, AudioConfig, OutputDevice};
 use crate::sf2::generators::{self as sfgen, note_name};
 use crate::sf2::{self, Instrument, Preset, SoundFont, Zone, sample_type};
 use crate::ui::gens::{generator_table, modulator_table};
 use crate::ui::keyboard::piano;
 use crate::ui::waveform::{WaveView, nearest_zero_crossing};
 use crate::ui::zones::{ZoneSel, key_drag, zone_map, zone_table};
-use crate::ui::Edit;
+use crate::ui::{Edit, card};
 use crate::wav;
 
 pub const APP_NAME: &str = "Solfege SoundFont Editor";
 const MAX_UNDO: usize = 100;
+const KEY_DEVICE: &str = "audio_device";
+const KEY_BUFFER: &str = "audio_buffer";
+const BUFFER_SIZES: &[u32] = &[64, 128, 256, 512, 1024, 2048];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sel {
@@ -72,6 +75,8 @@ pub struct App {
     pc_held: Vec<(Key, u8)>,
     sounding: [u8; 128],
     loop_preview: bool,
+    /// Amount for the sample editor's "Apply gain" tool.
+    gain_db: f32,
 
     wave: WaveView,
     wave_for: Option<usize>,
@@ -79,20 +84,36 @@ pub struct App {
     pending: Option<Pending>,
     error: Option<String>,
     show_problems: bool,
+    show_audio_settings: bool,
+    /// Settings being edited in the audio window (applied on "Apply").
+    audio_draft: AudioConfig,
+    /// Cached device list; refreshed when the settings window opens.
+    devices: Vec<OutputDevice>,
     title: String,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         cc.egui_ctx.global_style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 5.0);
+            use egui::{FontId, TextStyle};
+            s.spacing.item_spacing = egui::vec2(10.0, 8.0);
+            s.spacing.button_padding = egui::vec2(8.0, 4.0);
+            s.spacing.interact_size.y = 24.0;
+            s.spacing.indent = 18.0;
+            s.text_styles.insert(TextStyle::Body, FontId::proportional(14.0));
+            s.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
+            s.text_styles.insert(TextStyle::Heading, FontId::proportional(21.0));
+            s.text_styles.insert(TextStyle::Small, FontId::proportional(11.5));
+            s.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.0));
         });
         install_fallback_fonts(&cc.egui_ctx);
-        let audio = Audio::new();
-        let status = match &audio.error {
-            Some(e) => format!("Audio unavailable: {e}"),
-            None => format!("Audio: {} @ {} Hz", audio.device_name, audio.sample_rate),
+        // Restore the output device / buffer size chosen in a previous session.
+        let audio_config = AudioConfig {
+            device_id: cc.storage.and_then(|s| s.get_string(KEY_DEVICE)).filter(|s| !s.is_empty()),
+            buffer_size: cc.storage.and_then(|s| s.get_string(KEY_BUFFER)).and_then(|s| s.parse().ok()),
         };
+        let audio = Audio::new(&audio_config);
+        let status = audio.status();
         let mut app = Self {
             sf: SoundFont::new_empty(),
             path: None,
@@ -112,12 +133,16 @@ impl App {
             pc_held: Vec::new(),
             sounding: [0; 128],
             loop_preview: true,
+            gain_db: -6.0,
             wave: WaveView::default(),
             wave_for: None,
             status,
             pending: None,
             error: None,
             show_problems: false,
+            show_audio_settings: false,
+            audio_draft: audio_config,
+            devices: Vec::new(),
             title: String::new(),
         };
         if let Some(p) = path {
@@ -684,6 +709,9 @@ impl App {
                 if ui.button("SoundFont info").clicked() {
                     self.select(Sel::Info);
                 }
+                if ui.button("Audio settings…").clicked() {
+                    self.open_audio_settings();
+                }
                 if ui.button("Check for problems").clicked() {
                     self.show_problems = true;
                 }
@@ -697,12 +725,15 @@ impl App {
     }
 
     fn list_panel(&mut self, ui: &mut Ui) {
+        ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+            let title = RichText::new(format!("ℹ  {}", self.sf.info.name)).strong();
+            if ui.selectable_label(self.sel == Sel::Info, title).on_hover_text("SoundFont info").clicked() {
+                self.select(Sel::Info);
+            }
+        });
         ui.add_space(4.0);
-        if ui.selectable_label(self.sel == Sel::Info, RichText::new(format!("ℹ  {}", self.sf.info.name)).strong()).clicked() {
-            self.select(Sel::Info);
-        }
-        ui.separator();
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             for (tab, label, n) in [
                 (Tab::Presets, "Presets", self.sf.presets.len()),
                 (Tab::Instruments, "Instruments", self.sf.instruments.len()),
@@ -711,7 +742,8 @@ impl App {
                 ui.selectable_value(&mut self.tab, tab, format!("{label} {n}"));
             }
         });
-        ui.add(TextEdit::singleline(&mut self.filter).hint_text("🔍 Filter").desired_width(f32::INFINITY));
+        ui.add_space(2.0);
+        ui.add(TextEdit::singleline(&mut self.filter).hint_text("🔍 Filter").desired_width(f32::INFINITY).margin(egui::vec2(6.0, 4.0)));
         ui.horizontal(|ui| {
             let add_label = if self.tab == Tab::Samples { "➕ Import WAV" } else { "➕ New" };
             if ui.button(add_label).clicked() {
@@ -728,6 +760,7 @@ impl App {
                 self.delete_selected();
             }
         });
+        ui.add_space(2.0);
         ui.separator();
 
         let filter = self.filter.to_lowercase();
@@ -759,17 +792,22 @@ impl App {
                 .collect(),
         };
 
-        let row_h = ui.text_style_height(&egui::TextStyle::Button) + 4.0;
         let mut clicked = None;
-        ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, items.len(), |ui, range| {
-            for (sel, label, used) in &items[range] {
-                let text = if *used { RichText::new(label) } else { RichText::new(label).weak().italics() };
-                let r = ui.add_sized([ui.available_width(), row_h], egui::Button::selectable(self.sel == *sel, text));
-                let r = if *used { r } else { r.on_hover_text("Not used by any preset/instrument") };
-                if r.clicked() {
-                    clicked = Some(*sel);
-                }
-            }
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let row_h = ui.spacing().interact_size.y + 2.0;
+            ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, items.len(), |ui, range| {
+                ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
+                    for (sel, label, used) in &items[range] {
+                        let text = if *used { RichText::new(label) } else { RichText::new(label).weak().italics() };
+                        let r = ui.add(egui::Button::selectable(self.sel == *sel, text).min_size(egui::vec2(0.0, row_h)));
+                        let r = if *used { r } else { r.on_hover_text("Not used by any preset/instrument") };
+                        if r.clicked() {
+                            clicked = Some(*sel);
+                        }
+                    }
+                });
+            });
         });
         if let Some(s) = clicked {
             self.select(s);
@@ -777,45 +815,51 @@ impl App {
     }
 
     fn keyboard_panel(&mut self, ui: &mut Ui) {
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let target = match self.sel {
-                Sel::Preset(i) => format!("Preset: {}", self.sf.presets[i].name),
-                Sel::Instrument(i) => format!("Instrument: {}", self.sf.instruments[i].name),
-                Sel::Sample(i) => format!("Sample: {}", self.sf.samples[i].name),
+                Sel::Preset(i) => format!("Preset · {}", self.sf.presets[i].name),
+                Sel::Instrument(i) => format!("Instrument · {}", self.sf.instruments[i].name),
+                Sel::Sample(i) => format!("Sample · {}", self.sf.samples[i].name),
                 Sel::Info => "Select a preset, instrument or sample to play".into(),
             };
-            ui.label(RichText::new("🎹").size(16.0));
+            ui.label(RichText::new("🎹").size(17.0));
             ui.strong(target);
-            ui.separator();
+            ui.add_space(16.0);
             ui.label("Velocity");
             ui.add(DragValue::new(&mut self.velocity).range(1..=127));
+            ui.add_space(8.0);
             ui.label("Octave");
             ui.add(DragValue::new(&mut self.octave).range(-1..=8)).on_hover_text("PC keys Z–M / Q–P play from this octave (←/→ to change)");
             if matches!(self.sel, Sel::Sample(_)) {
+                ui.add_space(8.0);
                 ui.checkbox(&mut self.loop_preview, "Loop");
             }
-            ui.separator();
-            if let Ok(mut m) = self.audio.mixer.lock() {
-                ui.label("Volume");
-                ui.add(egui::Slider::new(&mut m.master, 0.0..=1.5).show_value(false));
-                ui.label(RichText::new(format!("{} voices", m.active_voices())).weak().monospace());
-            }
-            if ui.button("⏹ Stop").on_hover_text("All notes off (Esc)").clicked() {
-                self.audio.all_off();
-                self.sounding = [0; 128];
-            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("⏹ Stop").on_hover_text("All notes off (Esc)").clicked() {
+                    self.audio.all_off();
+                    self.sounding = [0; 128];
+                }
+                if ui.button("⚙ Audio").on_hover_text("Audio output settings").clicked() {
+                    self.open_audio_settings();
+                }
+                ui.add_space(12.0);
+                if let Ok(mut m) = self.audio.mixer.lock() {
+                    ui.label(RichText::new(format!("{:>2} voices", m.active_voices())).weak().monospace());
+                    ui.add(egui::Slider::new(&mut m.master, 0.0..=1.5).show_value(false));
+                    ui.label("Volume");
+                }
+            });
         });
+        ui.add_space(6.0);
         let sounding = self.sounding_mask();
         let mapped = self.mapped_keys();
-        let out = piano(ui, 72.0, &sounding, &mapped, &mut self.mouse_note);
+        let out = piano(ui, 76.0, &sounding, &mapped, &mut self.mouse_note);
         if let Some(k) = out.note_off {
             self.note_off(k);
         }
         if let Some(k) = out.note_on {
             self.note_on(k);
         }
-        ui.add_space(2.0);
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -843,63 +887,77 @@ impl App {
     }
 
     fn info_editor(&mut self, ui: &mut Ui) {
-        ui.heading("SoundFont Info");
-        ui.add_space(6.0);
-        let edit = &mut self.edit;
-        let info = &mut self.sf.info;
-        egui::Grid::new("info").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            let mut field = |ui: &mut Ui, label: &str, value: &mut String, multiline: bool| {
-                ui.label(label);
-                let r = if multiline {
-                    ui.add(TextEdit::multiline(value).desired_width(480.0).desired_rows(4))
-                } else {
-                    ui.add(TextEdit::singleline(value).desired_width(480.0).char_limit(255))
-                };
-                edit.track(&r);
-                ui.end_row();
-            };
-            field(ui, "Name", &mut info.name, false);
-            field(ui, "Author / engineers", &mut info.engineers, false);
-            field(ui, "Copyright", &mut info.copyright, false);
-            field(ui, "Creation date", &mut info.creation_date, false);
-            field(ui, "Product", &mut info.product, false);
-            field(ui, "Sound engine", &mut info.sound_engine, false);
-            field(ui, "Comment", &mut info.comment, true);
-            ui.label("Format version");
-            ui.label(format!("{}.{:02}", info.version.0, info.version.1));
-            ui.end_row();
-            ui.label("Software");
-            ui.label(RichText::new(&info.software).weak());
-            ui.end_row();
-            if !info.rom_name.is_empty() {
-                ui.label("ROM");
-                ui.label(&info.rom_name);
-                ui.end_row();
-            }
+        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.set_max_width(760.0);
+            ui.label(RichText::new("SOUNDFONT").small().weak());
+            ui.heading(&self.sf.info.name);
+            ui.label(
+                RichText::new(format!(
+                    "{} presets · {} instruments · {} samples",
+                    self.sf.presets.len(),
+                    self.sf.instruments.len(),
+                    self.sf.samples.len()
+                ))
+                .weak(),
+            );
+            ui.add_space(14.0);
+            let edit = &mut self.edit;
+            let info = &mut self.sf.info;
+            card(ui, "Details", |ui| {
+                egui::Grid::new("info").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
+                    let mut field = |ui: &mut Ui, label: &str, value: &mut String, multiline: bool| {
+                        ui.label(label);
+                        let r = if multiline {
+                            ui.add(TextEdit::multiline(value).desired_width(f32::INFINITY).desired_rows(5).margin(egui::vec2(6.0, 4.0)))
+                        } else {
+                            ui.add(TextEdit::singleline(value).desired_width(f32::INFINITY).char_limit(255).margin(egui::vec2(6.0, 4.0)))
+                        };
+                        edit.track(&r);
+                        ui.end_row();
+                    };
+                    field(ui, "Name", &mut info.name, false);
+                    field(ui, "Author / engineers", &mut info.engineers, false);
+                    field(ui, "Copyright", &mut info.copyright, false);
+                    field(ui, "Creation date", &mut info.creation_date, false);
+                    field(ui, "Product", &mut info.product, false);
+                    field(ui, "Sound engine", &mut info.sound_engine, false);
+                    field(ui, "Comment", &mut info.comment, true);
+                });
+            });
+            ui.add_space(12.0);
+            card(ui, "File", |ui| {
+                egui::Grid::new("info_file").num_columns(2).spacing([20.0, 8.0]).show(ui, |ui| {
+                    ui.label("Path");
+                    ui.label(RichText::new(self.path.as_ref().map_or("Not saved yet".into(), |p| p.display().to_string())).weak());
+                    ui.end_row();
+                    ui.label("Format version");
+                    ui.label(format!("{}.{:02}", info.version.0, info.version.1));
+                    ui.end_row();
+                    ui.label("Software");
+                    ui.label(RichText::new(&info.software).weak());
+                    ui.end_row();
+                    if !info.rom_name.is_empty() {
+                        ui.label("ROM");
+                        ui.label(&info.rom_name);
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(
+                    "Tip: drop a .sf2 file to open it, or .wav files to import samples. \
+                     Play notes with the on-screen piano or the PC keyboard (Z–M, Q–P).",
+                )
+                .weak(),
+            );
         });
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(format!(
-            "{} presets · {} instruments · {} samples",
-            self.sf.presets.len(),
-            self.sf.instruments.len(),
-            self.sf.samples.len()
-        ));
-        if let Some(p) = &self.path {
-            ui.label(RichText::new(p.display().to_string()).weak());
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new(
-            "Tip: drop a .sf2 file to open it, or .wav files to import samples. \
-             Play notes with the on-screen piano or the PC keyboard (Z–M, Q–P).",
-        )
-        .weak());
     }
 
     fn preset_editor(&mut self, ui: &mut Ui, idx: usize) {
         let names: Vec<String> = self.sf.instruments.iter().map(|x| x.name.clone()).collect();
         let sounding = self.sounding_mask();
-        let navigate;
+        let mut navigate = None;
         let mut make_unique = false;
         {
             let Self { sf, edit, zone_sel, .. } = self;
@@ -907,32 +965,29 @@ impl App {
                 sf.presets.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, p)| (p.bank, p.program)).collect();
             let p = &mut sf.presets[idx];
 
-            ui.horizontal(|ui| {
-                ui.heading("Preset");
-                edit.track(&ui.add(TextEdit::singleline(&mut p.name).char_limit(20).desired_width(200.0).font(egui::TextStyle::Heading)));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Bank");
-                edit.track(&ui.add(DragValue::new(&mut p.bank).range(0..=128)));
-                ui.label("Program");
+            let meta = format!("{} zone{}", p.zones.len(), if p.zones.len() == 1 { "" } else { "s" });
+            editor_header(ui, "Preset", &mut p.name, edit, &meta, |ui, edit| {
+                // Added right to left; reads "⚠ … Fix   Bank [n]   Program [n]".
                 edit.track(&ui.add(DragValue::new(&mut p.program).range(0..=127)));
+                ui.label("Program");
+                ui.add_space(8.0);
+                edit.track(&ui.add(DragValue::new(&mut p.bank).range(0..=128)));
+                ui.label("Bank");
                 if taken.contains(&(p.bank, p.program)) {
+                    ui.add_space(8.0);
+                    make_unique = ui.button("Fix").on_hover_text("Pick a free program number").clicked();
                     ui.label(RichText::new("⚠ bank/program already used").color(ui.visuals().warn_fg_color));
-                    make_unique = ui.small_button("Fix").clicked();
                 }
             });
-            ui.add_space(6.0);
 
             let labels: Vec<String> = p.zones.iter().map(|z| z.link.and_then(|l| names.get(l)).cloned().unwrap_or_default()).collect();
-            if let Some(i) = zone_map(ui, &p.zones, &labels, *zone_sel, &sounding) {
-                *zone_sel = ZoneSel::Zone(i);
-            }
-            ui.add_space(6.0);
-            let res = zone_table(ui, "preset_zones", &mut p.global, &mut p.zones, &names, "Instrument", zone_sel, edit, None);
-            navigate = res.navigate;
-
-            ui.add_space(8.0);
-            zone_inspector(ui, "pgen", zone_sel, &mut p.global, &mut p.zones, true, &names, edit);
+            card(ui, "Key map", |ui| {
+                if let Some(i) = zone_map(ui, &p.zones, &labels, *zone_sel, &sounding) {
+                    *zone_sel = ZoneSel::Zone(i);
+                }
+            });
+            ui.add_space(12.0);
+            zone_split(ui, "preset", zone_sel, &mut p.global, &mut p.zones, &names, "Instrument", true, edit, None, &mut navigate);
         }
         if make_unique {
             let bank = self.sf.presets[idx].bank;
@@ -950,28 +1005,30 @@ impl App {
         let roots: Vec<u8> = self.sf.samples.iter().map(|s| s.original_pitch).collect();
         let sounding = self.sounding_mask();
         let users = self.sf.instrument_users(idx);
-        let navigate;
+        let mut navigate = None;
         let mut make_preset = false;
         {
             let Self { sf, edit, zone_sel, .. } = self;
             let inst = &mut sf.instruments[idx];
-            ui.horizontal(|ui| {
-                ui.heading("Instrument");
-                edit.track(&ui.add(TextEdit::singleline(&mut inst.name).char_limit(20).desired_width(200.0).font(egui::TextStyle::Heading)));
-            });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Used by {users} preset{}", if users == 1 { "" } else { "s" })).weak());
-                if ui.button("Create preset from this instrument").clicked() {
+            let meta = format!(
+                "{} zone{} · used by {users} preset{}",
+                inst.zones.len(),
+                if inst.zones.len() == 1 { "" } else { "s" },
+                if users == 1 { "" } else { "s" }
+            );
+            editor_header(ui, "Instrument", &mut inst.name, edit, &meta, |ui, _| {
+                if ui.button("Create preset").on_hover_text("Create a new preset that plays this instrument").clicked() {
                     make_preset = true;
                 }
             });
-            ui.add_space(6.0);
 
             let labels: Vec<String> = inst.zones.iter().map(|z| z.link.and_then(|l| names.get(l)).cloned().unwrap_or_default()).collect();
-            if let Some(i) = zone_map(ui, &inst.zones, &labels, *zone_sel, &sounding) {
-                *zone_sel = ZoneSel::Zone(i);
-            }
-            ui.add_space(6.0);
+            card(ui, "Key map", |ui| {
+                if let Some(i) = zone_map(ui, &inst.zones, &labels, *zone_sel, &sounding) {
+                    *zone_sel = ZoneSel::Zone(i);
+                }
+            });
+            ui.add_space(12.0);
             let global_root = inst.global.as_ref().and_then(|g| g.get_i(sfgen::OVERRIDING_ROOT_KEY));
             let root = |z: &Zone| {
                 let r = z
@@ -981,11 +1038,7 @@ impl App {
                     .or_else(|| z.link.and_then(|l| roots.get(l)).map(|r| *r as i32));
                 r.map(|r| note_name(r as u8)).unwrap_or_default()
             };
-            let res = zone_table(ui, "inst_zones", &mut inst.global, &mut inst.zones, &names, "Sample", zone_sel, edit, Some(("Root", &root)));
-            navigate = res.navigate;
-
-            ui.add_space(8.0);
-            zone_inspector(ui, "igen", zone_sel, &mut inst.global, &mut inst.zones, false, &names, edit);
+            zone_split(ui, "instrument", zone_sel, &mut inst.global, &mut inst.zones, &names, "Sample", false, edit, Some(("Root", &root)), &mut navigate);
         }
         if make_preset {
             self.preset_from_instrument(idx);
@@ -1012,139 +1065,171 @@ impl App {
             Replace,
             MakeInstrument,
             Normalize,
+            Gain(f32),
             Reverse,
             Navigate(usize),
         }
         let mut action = None;
         {
-            let Self { sf, edit, wave, .. } = self;
+            let Self { sf, edit, wave, gain_db, .. } = self;
             let s = &mut sf.samples[idx];
             let len = s.data.len() as u32;
 
-            ui.horizontal(|ui| {
-                ui.heading("Sample");
-                edit.track(&ui.add(TextEdit::singleline(&mut s.name).char_limit(20).desired_width(200.0).font(egui::TextStyle::Heading)));
-            });
             let secs = len as f64 / s.sample_rate.max(1) as f64;
-            ui.label(RichText::new(format!(
+            let meta = format!(
                 "{len} points · {secs:.3} s · {} · used by {users} instrument{}",
                 s.type_name(),
                 if users == 1 { "" } else { "s" }
-            ))
-            .weak());
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                if ui.button("Zoom all").clicked() {
-                    wave.zoom_all(s.data.len());
-                }
-                if ui.add_enabled(s.loop_end > s.loop_start, egui::Button::new("Zoom loop")).clicked() {
-                    wave.zoom_to(s.loop_start, s.loop_end);
-                }
-                if ui.add_enabled(s.loop_end > s.loop_start, egui::Button::new("Zoom loop end")).clicked() {
-                    wave.zoom_to(s.loop_end.saturating_sub(200), s.loop_end + 200);
-                }
-                ui.separator();
-                if ui.button("Snap loop to zero crossings").clicked() {
-                    s.loop_start = nearest_zero_crossing(&s.data, s.loop_start);
-                    s.loop_end = nearest_zero_crossing(&s.data, s.loop_end).max(s.loop_start);
-                    edit.structural();
-                }
-                if ui.button("Clear loop").clicked() {
-                    s.loop_start = 0;
-                    s.loop_end = 0;
-                    edit.structural();
-                }
-                if ui.button("Loop whole sample").clicked() {
-                    s.loop_start = 0;
-                    s.loop_end = len;
-                    edit.structural();
-                }
-            });
-            let (mut ls, mut le) = (s.loop_start, s.loop_end);
-            if wave.show(ui, 220.0, &s.data, &mut ls, &mut le, &playheads) {
-                s.loop_start = ls;
-                s.loop_end = le;
-                edit.changed = true;
-            }
-            ui.add_space(6.0);
-
-            egui::Grid::new("sample_props").num_columns(4).spacing([16.0, 6.0]).show(ui, |ui| {
-                ui.label("Loop start");
-                let le = s.loop_end;
-                edit.track(&ui.add(DragValue::new(&mut s.loop_start).range(0..=le).speed(1.0)));
-                ui.label("Loop end");
-                let ls = s.loop_start;
-                edit.track(&ui.add(DragValue::new(&mut s.loop_end).range(ls..=len).speed(1.0)));
-                ui.end_row();
-
-                ui.label("Root key");
-                edit.track(&ui.add(key_drag(&mut s.original_pitch)));
-                ui.label("Pitch correction");
-                edit.track(&ui.add(DragValue::new(&mut s.pitch_correction).range(-99..=99).suffix(" cents")));
-                ui.end_row();
-
-                ui.label("Sample rate");
-                edit.track(&ui.add(DragValue::new(&mut s.sample_rate).range(400..=192_000).suffix(" Hz")));
-                ui.label("Loop length");
-                ui.label(format!("{} points", s.loop_end.saturating_sub(s.loop_start)));
-                ui.end_row();
-
-                ui.label("Type");
-                let rom = s.sample_type & sample_type::ROM;
-                let mut t = s.sample_type & 0x7FFF;
-                ComboBox::from_id_salt("stype").selected_text(s.type_name()).show_ui(ui, |ui| {
-                    for (v, n) in [
-                        (sample_type::MONO, "Mono"),
-                        (sample_type::LEFT, "Left"),
-                        (sample_type::RIGHT, "Right"),
-                        (sample_type::LINKED, "Linked"),
-                    ] {
-                        edit.track(&ui.selectable_value(&mut t, v, n));
-                    }
-                });
-                s.sample_type = t | rom;
-                ui.label("Linked sample");
-                ui.add_enabled_ui(t != sample_type::MONO, |ui| {
-                    let text = s.link.and_then(|l| names.get(l)).map(String::as_str).unwrap_or("—");
-                    ComboBox::from_id_salt("slink").selected_text(text).height(400.0).show_ui(ui, |ui| {
-                        if ui.selectable_label(s.link.is_none(), "—").clicked() {
-                            s.link = None;
-                            edit.changed = true;
-                        }
-                        for (i, n) in names.iter().enumerate().filter(|(i, _)| *i != idx) {
-                            if ui.selectable_label(s.link == Some(i), n).clicked() {
-                                s.link = Some(i);
-                                edit.changed = true;
-                            }
-                        }
-                    });
-                    if let Some(l) = s.link
-                        && ui.small_button("➡").on_hover_text("Go to linked sample").clicked()
-                    {
-                        action = Some(Action::Navigate(l));
-                    }
-                });
-                ui.end_row();
-            });
-
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("🎛 Create instrument from sample").clicked() {
+            );
+            editor_header(ui, "Sample", &mut s.name, edit, &meta, |ui, _| {
+                if ui.button("➕ Create instrument").on_hover_text("Create an instrument that plays this sample").clicked() {
                     action = Some(Action::MakeInstrument);
                 }
-                if ui.button("💾 Export WAV…").clicked() {
-                    action = Some(Action::Export);
-                }
-                if ui.button("📂 Replace from WAV…").clicked() {
-                    action = Some(Action::Replace);
-                }
-                if ui.button("Normalize").clicked() {
-                    action = Some(Action::Normalize);
-                }
-                if ui.button("Reverse").clicked() {
-                    action = Some(Action::Reverse);
-                }
+            });
+
+            ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                card(ui, "Waveform", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Zoom all").clicked() {
+                            wave.zoom_all(s.data.len());
+                        }
+                        let has_loop = s.loop_end > s.loop_start;
+                        if ui.add_enabled(has_loop, egui::Button::new("Zoom loop")).clicked() {
+                            wave.zoom_to(s.loop_start, s.loop_end);
+                        }
+                        if ui.add_enabled(has_loop, egui::Button::new("Zoom loop end")).clicked() {
+                            wave.zoom_to(s.loop_end.saturating_sub(200), s.loop_end + 200);
+                        }
+                        ui.add_space(12.0);
+                        if ui.button("Snap to zero crossings").on_hover_text("Move both loop points to the nearest rising zero crossing").clicked() {
+                            s.loop_start = nearest_zero_crossing(&s.data, s.loop_start);
+                            s.loop_end = nearest_zero_crossing(&s.data, s.loop_end).max(s.loop_start);
+                            edit.structural();
+                        }
+                        if ui.button("Loop whole sample").clicked() {
+                            s.loop_start = 0;
+                            s.loop_end = len;
+                            edit.structural();
+                        }
+                        if ui.button("Clear loop").clicked() {
+                            s.loop_start = 0;
+                            s.loop_end = 0;
+                            edit.structural();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    let (mut ls, mut le) = (s.loop_start, s.loop_end);
+                    if wave.show(ui, 240.0, &s.data, &mut ls, &mut le, &playheads) {
+                        s.loop_start = ls;
+                        s.loop_end = le;
+                        edit.changed = true;
+                    }
+                });
+                ui.add_space(12.0);
+
+                ui.columns(2, |cols| {
+                    card(&mut cols[0], "Loop & pitch", |ui| {
+                        egui::Grid::new("sample_loop").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
+                            ui.label("Loop start");
+                            let le = s.loop_end;
+                            edit.track(&ui.add(DragValue::new(&mut s.loop_start).range(0..=le).speed(1.0)));
+                            ui.end_row();
+                            ui.label("Loop end");
+                            let ls = s.loop_start;
+                            edit.track(&ui.add(DragValue::new(&mut s.loop_end).range(ls..=len).speed(1.0)));
+                            ui.end_row();
+                            ui.label("Loop length");
+                            ui.label(RichText::new(format!("{} points", s.loop_end.saturating_sub(s.loop_start))).weak());
+                            ui.end_row();
+                            ui.label("Root key");
+                            edit.track(&ui.add(key_drag(&mut s.original_pitch)));
+                            ui.end_row();
+                            ui.label("Pitch correction");
+                            edit.track(&ui.add(DragValue::new(&mut s.pitch_correction).range(-99..=99).suffix(" cents")));
+                            ui.end_row();
+                        });
+                    });
+                    card(&mut cols[1], "Format", |ui| {
+                        egui::Grid::new("sample_fmt").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
+                            ui.label("Sample rate");
+                            edit.track(&ui.add(DragValue::new(&mut s.sample_rate).range(400..=192_000).suffix(" Hz")));
+                            ui.end_row();
+                            ui.label("Type");
+                            let rom = s.sample_type & sample_type::ROM;
+                            let mut t = s.sample_type & 0x7FFF;
+                            ComboBox::from_id_salt("stype").selected_text(s.type_name()).show_ui(ui, |ui| {
+                                for (v, n) in [
+                                    (sample_type::MONO, "Mono"),
+                                    (sample_type::LEFT, "Left"),
+                                    (sample_type::RIGHT, "Right"),
+                                    (sample_type::LINKED, "Linked"),
+                                ] {
+                                    edit.track(&ui.selectable_value(&mut t, v, n));
+                                }
+                            });
+                            s.sample_type = t | rom;
+                            ui.end_row();
+                            ui.label("Linked sample");
+                            ui.add_enabled_ui(t != sample_type::MONO, |ui| {
+                                ui.horizontal(|ui| {
+                                    let text = s.link.and_then(|l| names.get(l)).map(String::as_str).unwrap_or("—");
+                                    ComboBox::from_id_salt("slink").selected_text(text).width(170.0).height(400.0).show_ui(ui, |ui| {
+                                        if ui.selectable_label(s.link.is_none(), "—").clicked() {
+                                            s.link = None;
+                                            edit.changed = true;
+                                        }
+                                        for (i, n) in names.iter().enumerate().filter(|(i, _)| *i != idx) {
+                                            if ui.selectable_label(s.link == Some(i), n).clicked() {
+                                                s.link = Some(i);
+                                                edit.changed = true;
+                                            }
+                                        }
+                                    });
+                                    if let Some(l) = s.link
+                                        && ui.small_button("➡").on_hover_text("Go to linked sample").clicked()
+                                    {
+                                        action = Some(Action::Navigate(l));
+                                    }
+                                });
+                            });
+                            ui.end_row();
+                        });
+                    });
+                });
+                ui.add_space(12.0);
+
+                card(ui, "Level & processing", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let peak = s.data.iter().map(|v| (*v as i32).abs()).max().unwrap_or(0);
+                        let peak_db = if peak > 0 { 20.0 * (peak as f64 / 32768.0).log10() } else { f64::NEG_INFINITY };
+                        let text = RichText::new(format!("Peak {peak_db:.1} dBFS")).monospace();
+                        ui.label(if peak >= 32767 { text.color(ui.visuals().warn_fg_color) } else { text })
+                            .on_hover_text("At 0 dBFS the sample is at full scale and may already be clipped in the source.");
+                        ui.add_space(16.0);
+                        ui.add(DragValue::new(gain_db).range(-48.0..=24.0).speed(0.1).fixed_decimals(1).suffix(" dB"));
+                        if ui.button("Apply gain").on_hover_text("Scale the sample data (negative = quieter). Values that exceed full scale are clipped.").clicked() {
+                            action = Some(Action::Gain(*gain_db));
+                        }
+                        if ui.button("Normalize").on_hover_text("Raise the peak to -0.2 dBFS").clicked() {
+                            action = Some(Action::Normalize);
+                        }
+                        if ui.button("Reverse").clicked() {
+                            action = Some(Action::Reverse);
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+
+                card(ui, "File", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("💾 Export WAV…").clicked() {
+                            action = Some(Action::Export);
+                        }
+                        if ui.button("📂 Replace from WAV…").on_hover_text("Replace the audio data, keeping name, root key and loop").clicked() {
+                            action = Some(Action::Replace);
+                        }
+                    });
+                });
             });
         }
 
@@ -1190,6 +1275,30 @@ impl App {
                     s.data = Arc::new(s.data.iter().map(|v| (*v as f64 * gain).round().clamp(-32768.0, 32767.0) as i16).collect());
                     self.status = format!("Normalized ({:+.1} dB)", 20.0 * gain.log10());
                 }
+            }
+            Some(Action::Gain(db)) => {
+                self.checkpoint();
+                self.audio.all_off();
+                let gain = 10f64.powf(db as f64 / 20.0);
+                let s = &mut self.sf.samples[idx];
+                let mut clipped = 0usize;
+                s.data = Arc::new(
+                    s.data
+                        .iter()
+                        .map(|v| {
+                            let x = (*v as f64 * gain).round();
+                            if !(-32768.0..=32767.0).contains(&x) {
+                                clipped += 1;
+                            }
+                            x.clamp(-32768.0, 32767.0) as i16
+                        })
+                        .collect(),
+                );
+                self.status = if clipped > 0 {
+                    format!("Applied {db:+.1} dB — {clipped} points clipped (undo with Ctrl+Z)")
+                } else {
+                    format!("Applied {db:+.1} dB")
+                };
             }
             Some(Action::Reverse) => {
                 self.checkpoint();
@@ -1273,6 +1382,116 @@ impl App {
         }
     }
 
+    fn open_audio_settings(&mut self) {
+        self.devices = audio::output_devices();
+        self.audio_draft = self.audio.config.clone();
+        self.show_audio_settings = true;
+    }
+
+    fn audio_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_audio_settings;
+        let mut apply = false;
+        egui::Window::new("Audio settings").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            egui::Grid::new("audio_settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Output device");
+                ui.horizontal(|ui| {
+                    let current = match &self.audio_draft.device_id {
+                        None => "System default".to_string(),
+                        Some(id) => self.devices.iter().find(|d| &d.id == id).map_or_else(|| format!("{id} (not found)"), |d| d.name.clone()),
+                    };
+                    ComboBox::from_id_salt("out_dev").selected_text(current).width(320.0).height(400.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.audio_draft.device_id, None, "System default");
+                        for d in &self.devices {
+                            ui.selectable_value(&mut self.audio_draft.device_id, Some(d.id.clone()), &d.name).on_hover_text(&d.id);
+                        }
+                    });
+                    if ui.button("⟳").on_hover_text("Refresh device list").clicked() {
+                        self.devices = audio::output_devices();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Buffer size");
+                let rate = self.audio.sample_rate.max(1) as f32;
+                let label = |b: Option<u32>| match b {
+                    None => "Device default".to_string(),
+                    Some(n) => format!("{n} frames  ({:.1} ms)", n as f32 / rate * 1000.0),
+                };
+                ComboBox::from_id_salt("out_buf").selected_text(label(self.audio_draft.buffer_size)).width(320.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.audio_draft.buffer_size, None, label(None));
+                    for &n in BUFFER_SIZES {
+                        ui.selectable_value(&mut self.audio_draft.buffer_size, Some(n), label(Some(n)));
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Status");
+                let status = self.audio.status();
+                if self.audio.error.is_some() {
+                    ui.colored_label(ui.visuals().error_fg_color, status);
+                } else {
+                    ui.label(RichText::new(status).weak());
+                }
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Smaller buffers lower the latency when playing notes, but can crackle on a busy system.").weak().small());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.audio_draft != self.audio.config, egui::Button::new("Apply")).clicked() {
+                    apply = true;
+                }
+                if ui.button("Test sound").clicked() {
+                    self.test_tone();
+                }
+            });
+        });
+        self.show_audio_settings = open;
+        if apply {
+            self.mouse_note = None;
+            self.pc_held.clear();
+            self.sounding = [0; 128];
+            self.audio.reopen(&self.audio_draft.clone());
+            self.status = self.audio.status();
+        }
+    }
+
+    /// A short sine beep so the output can be checked without loading a SoundFont.
+    fn test_tone(&mut self) {
+        let rate = 44_100u32;
+        let data: Vec<i16> = (0..rate / 2)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                let fade = (1.0 - t * 2.0).max(0.0);
+                ((t * 440.0 * std::f32::consts::TAU).sin() * 12_000.0 * fade) as i16
+            })
+            .collect();
+        let len = data.len();
+        let voice = audio::VoiceParams {
+            data: Arc::new(data),
+            start: 0,
+            end: len,
+            loop_start: 0,
+            loop_end: 0,
+            mode: 0,
+            sample_rate: rate,
+            pitch_ratio: 1.0,
+            gain: 0.6,
+            pan: 0.0,
+            delay: 0.0,
+            attack: 0.005,
+            hold: 0.0,
+            decay: 100.0,
+            sustain: 1.0,
+            release: 0.05,
+            filter_fc: f32::MAX,
+            filter_q: 0.707,
+            exclusive_class: 0,
+        };
+        // Note 128 is outside the MIDI range, so it never collides with a held key.
+        self.audio.note_on(128, vec![voice]);
+    }
+
     fn finish_pending(&mut self, ctx: &egui::Context, action: Pending) {
         if matches!(action, Pending::Quit) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1312,6 +1531,59 @@ fn install_fallback_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Page header: kind label, editable name, a line of details, and right-aligned controls.
+fn editor_header(ui: &mut Ui, kind: &str, name: &mut String, edit: &mut Edit, meta: &str, controls: impl FnOnce(&mut Ui, &mut Edit)) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(kind.to_uppercase()).small().weak());
+            edit.track(&ui.add(
+                TextEdit::singleline(name).char_limit(20).desired_width(280.0).font(egui::TextStyle::Heading).margin(egui::vec2(6.0, 2.0)),
+            ));
+            ui.label(RichText::new(meta).weak());
+        });
+        // Right-to-left: `controls` adds its widgets starting from the rightmost one.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| controls(ui, edit));
+    });
+    ui.add_space(12.0);
+}
+
+/// Zone list on the left, generator inspector for the selected zone on the right.
+#[allow(clippy::too_many_arguments)]
+fn zone_split(
+    ui: &mut Ui,
+    id: &str,
+    sel: &mut ZoneSel,
+    global: &mut Option<Zone>,
+    zones: &mut Vec<Zone>,
+    names: &[String],
+    kind: &str,
+    preset_level: bool,
+    edit: &mut Edit,
+    extra: Option<crate::ui::zones::ExtraColumn<'_>>,
+    navigate: &mut Option<usize>,
+) {
+    egui::Panel::right(egui::Id::new((id, "inspector")))
+        .resizable(true)
+        .show_separator_line(false)
+        .default_size(430.0)
+        .size_range(340.0..=760.0)
+        .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 12, ..Default::default() }))
+        .show(ui, |ui| {
+            card(ui, "", |ui| {
+                ScrollArea::vertical().id_salt((id, "inspector_scroll")).auto_shrink(false).show(ui, |ui| {
+                    zone_inspector(ui, id, sel, global, zones, preset_level, names, edit);
+                });
+            });
+        });
+    egui::CentralPanel::no_frame().show(ui, |ui| {
+        card(ui, "Zones", |ui| {
+            ScrollArea::both().id_salt((id, "zones_scroll")).auto_shrink(false).show(ui, |ui| {
+                *navigate = zone_table(ui, id, global, zones, names, kind, sel, edit, extra).navigate;
+            });
+        });
+    });
+}
+
 /// Generator + modulator editor for whichever zone is selected.
 #[allow(clippy::too_many_arguments)]
 fn zone_inspector(
@@ -1331,26 +1603,33 @@ fn zone_inspector(
         },
         ZoneSel::Zone(i) if i < zones.len() => {
             let link = zones[i].link.and_then(|l| names.get(l)).cloned().unwrap_or_default();
-            (format!("Zone #{} — {link}", i + 1), &mut zones[i], global.as_ref())
+            (format!("Zone #{} · {link}", i + 1), &mut zones[i], global.as_ref())
         }
         _ => {
-            ui.label(RichText::new("Select a zone to edit its generators.").weak());
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("No zone selected").strong());
+                ui.label(RichText::new("Click a zone in the list or the key map\nto edit its generators.").weak());
+            });
             return;
         }
     };
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.heading(title);
-        if preset_level {
-            ui.label(RichText::new("(values are offsets added to the instrument)").weak());
-        }
-    });
-    ui.add_space(4.0);
+    ui.label(RichText::new(title).size(17.0).strong());
+    if preset_level {
+        ui.label(RichText::new("Values are offsets added to the instrument.").weak().small());
+    }
+    ui.add_space(6.0);
     generator_table(ui, id, zone, parent, preset_level, edit);
+    ui.add_space(4.0);
     modulator_table(ui, id, &mut zone.mods, edit);
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(KEY_DEVICE, self.audio.config.device_id.clone().unwrap_or_default());
+        storage.set_string(KEY_BUFFER, self.audio.config.buffer_size.map(|b| b.to_string()).unwrap_or_default());
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
@@ -1363,19 +1642,73 @@ impl eframe::App for App {
         let before = self.sf.clone();
         self.handle_input(&ctx);
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::bottom("keyboard").show(ui, |ui| self.keyboard_panel(ui));
-        egui::Panel::left("list").resizable(true).default_size(280.0).min_size(200.0).show(ui, |ui| self.list_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.editor(ui));
-        });
+        let style = ctx.global_style();
+        let panel = |x: i8, y: i8| egui::Frame::side_top_panel(&style).inner_margin(egui::Margin::symmetric(x, y));
+        egui::Panel::top("menu").frame(panel(10, 4)).show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::bottom("status").frame(panel(14, 4)).show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("keyboard").frame(panel(14, 10)).show(ui, |ui| self.keyboard_panel(ui));
+        egui::Panel::left("list").frame(panel(12, 12)).resizable(true).default_size(290.0).min_size(220.0).show(ui, |ui| self.list_panel(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&style).inner_margin(egui::Margin::same(18)))
+            .show(ui, |ui| self.editor(ui));
         self.dialogs(&ctx);
+        self.audio_settings_window(&ctx);
 
         self.finish_frame(&ctx, before);
         self.update_title(&ctx);
         if self.audio.mixer.lock().is_ok_and(|m| m.active_voices() > 0) {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+    }
+}
+
+#[cfg(test)]
+mod screenshots {
+    //! Renders the UI offscreen with wgpu so the layout can be reviewed as PNGs.
+    //! Run with: `SHOT_DIR=/some/dir cargo test screenshots -- --nocapture`
+    use super::*;
+    use crate::sf2::Sample;
+
+    fn demo_font() -> SoundFont {
+        let mut sf = SoundFont::new_empty();
+        sf.info.name = "Demo Kit".into();
+        let names = ["Kick", "Side Stick", "Snare", "Clap", "Snare 2", "Low Tom", "Closed Hat", "Floor Tom", "Pedal Hat", "Mid Tom", "Open Hat", "Hi Tom", "Crash", "Ride"];
+        let mut drums = Instrument { name: "Drum Kit".into(), ..Default::default() };
+        for (i, n) in names.iter().enumerate() {
+            let data: Vec<i16> = (0..20_000).map(|t| (((t as f32) * 0.05 * (i + 1) as f32).sin() * 20_000.0 * (1.0 - t as f32 / 20_000.0)) as i16).collect();
+            sf.samples.push(Sample { name: n.to_string(), data: Arc::new(data), sample_rate: 44_100, original_pitch: 60, sample_type: sample_type::MONO, ..Default::default() });
+            let key = 36 + i as u8;
+            let mut z = Zone { link: Some(i), ..Default::default() };
+            z.set_range(sfgen::KEY_RANGE, key, key);
+            if matches!(*n, "Closed Hat" | "Pedal Hat" | "Open Hat") {
+                z.set_i(sfgen::EXCLUSIVE_CLASS, 1);
+            }
+            drums.zones.push(z);
+        }
+        sf.instruments.push(drums);
+        sf.presets.push(Preset { name: "Standard Kit".into(), bank: 128, zones: vec![Zone { link: Some(0), ..Default::default() }], ..Default::default() });
+        sf
+    }
+
+    #[test]
+    fn render_layout() {
+        let Ok(dir) = std::env::var("SHOT_DIR") else { return };
+        for (name, sel, zone) in [
+            ("instrument", Sel::Instrument(0), ZoneSel::Zone(6)),
+            ("preset", Sel::Preset(0), ZoneSel::Zone(0)),
+            ("sample", Sel::Sample(10), ZoneSel::None),
+            ("info", Sel::Info, ZoneSel::None),
+        ] {
+            let mut harness = egui_kittest::Harness::builder().with_size([1360.0, 860.0]).wgpu().build_eframe(|cc| {
+                let mut app = App::new(cc, None);
+                app.sf = demo_font();
+                app.select(sel);
+                app.zone_sel = zone;
+                app
+            });
+            harness.run();
+            let img = harness.render().expect("render");
+            img.save(format!("{dir}/{name}.png")).unwrap();
         }
     }
 }
